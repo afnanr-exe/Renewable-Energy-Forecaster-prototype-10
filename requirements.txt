@@ -7,3 +7,5 @@ matplotlib
 PyYAML
 requests
 python-multipart
+gunicorn
+uvicorn
