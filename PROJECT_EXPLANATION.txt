@@ -1,0 +1,753 @@
+================================================================================
+  WIND AND SOLAR POWER FORECASTER — COMPLETE TECHNICAL EXPLANATION
+  Capstone Prototype 8.0 | Toronto Metropolitan University
+================================================================================
+
+This document explains the full architecture, data flow, and technical design
+decisions of the Wind and Solar Power Forecaster project. It is intended as a
+thorough reference for technical interviews.
+
+
+================================================================================
+  1. PROJECT OVERVIEW
+================================================================================
+
+The Wind and Solar Power Forecaster is a full-stack web application that:
+
+  1. Ingests historical electricity generation data from Canadian energy markets
+     (IESO for Ontario, AESO for Alberta) or from user-uploaded files.
+  2. Fetches matching historical weather data from an external API (Open-Meteo).
+  3. Merges generation and weather data by timestamp into a single "master CSV".
+  4. Trains two regression models (Linear and Polynomial) separately for wind
+     and solar generation, using weather variables as predictors.
+  5. Displays model quality metrics (R-squared, regression equation) and
+     diagnostic plots (scatter and time-series) in the browser.
+  6. Provides a 48-hour ahead generation forecast by loading the trained model
+     and querying the Open-Meteo forecast API for future weather conditions.
+
+The system is designed to be market-agnostic: the same modelling pipeline runs
+regardless of whether data comes from IESO, AESO, or a user upload. All three
+paths converge on the same "master CSV" schema before any modelling begins.
+
+
+Technology stack:
+  - Backend:  Python 3.11, FastAPI, Uvicorn (ASGI server)
+  - ML:       scikit-learn (LinearRegression, HuberRegressor, PolynomialFeatures)
+  - Data:     pandas, numpy
+  - Plotting: matplotlib (server-side, Agg backend — no display required)
+  - Persistence: joblib (model serialization)
+  - HTTP:     requests (weather API calls)
+  - Frontend: Vanilla HTML/CSS/JavaScript, Chart.js (interactive charts),
+              Leaflet (map), no build step required
+  - Config:   config.yaml (PyYAML)
+
+
+================================================================================
+  2. REPOSITORY STRUCTURE
+================================================================================
+
+  app/
+    main.py              -- FastAPI application; all API route definitions
+
+  services/
+    universal_pipeline.py  -- Central orchestrator; drives all three data paths
+    forecast_service.py    -- 48-hour generation forecast logic
+    metadata_manager.py    -- Tracks last-run dates in a JSON file
+    error_handler.py       -- Thin wrappers over FastAPI HTTPException
+
+  adapters/
+    aeso_adapter.py        -- Parse AESO CSV files into wind/solar rows
+    ieso_adapter.py        -- Download and parse IESO XML files
+    schema_detector.py     -- Scoring-based column-name detection for uploads
+    user_adapter.py        -- Full ingestion pipeline for user-uploaded files
+    test_schema_detector.py -- Unit tests for schema detection
+
+  pipelines/
+    aeso_pipeline.py       -- AESO end-to-end: load -> weather -> master CSV
+    ieso_pipeline.py       -- IESO end-to-end: download XML -> weather -> master CSV
+    user_pipeline.py       -- Upload end-to-end: ingest -> validate -> weather -> master CSV
+
+  models/
+    regression_engine.py   -- Train Linear and Polynomial models; save artifacts; generate plots
+
+  weather/
+    weather_fetcher.py     -- Open-Meteo API calls (archive + forecast + geocoding)
+
+  frontend/
+    index.html             -- Single-page application (all HTML, CSS, JS in one file)
+
+  output/
+    aeso/                  -- Master CSV, model-ready CSVs for AESO runs
+    ieso/                  -- Master CSV, model-ready CSVs for IESO runs
+    upload/                -- Master CSV, model-ready CSVs for upload runs
+    models/                -- Trained .pkl model artifacts
+    plots/                 -- Diagnostic PNG plots
+    metadata.json          -- Last-run date tracking
+
+  config.yaml              -- Market-specific paths and timezone settings
+  requirements.txt         -- Python dependencies
+
+
+================================================================================
+  3. DATA SOURCES
+================================================================================
+
+--- 3.1  IESO (Independent Electricity System Operator — Ontario) ---
+
+  IESO publishes hourly generation-by-fuel data as XML files on a public web
+  server:
+    https://reports-public.ieso.ca/public/GenOutputbyFuelHourly/
+
+  The files are named:
+    PUB_GenOutputbyFuelHourly_<YEAR>.xml
+    PUB_GenOutputbyFuelHourly_<YEAR>_v<N>.xml  (versioned updates)
+
+  The adapter (adapters/ieso_adapter.py) does the following:
+    - Determines which years to download (last 3-4 years based on the current month).
+    - For each year, scrapes the IESO directory listing to find the highest-
+      version file available, then downloads it only if not already cached locally.
+    - Parses the XML using Python's xml.etree.ElementTree with the IESO namespace
+      (http://www.ieso.ca/schema).
+    - XML structure: DailyData -> HourlyData -> FuelTotal (one per fuel type).
+    - Extracts Wind and Solar output (MWh) for each hour.
+    - IESO uses hour=24 to mean midnight of the following calendar day — the
+      parser correctly converts this to the next day at hour=00.
+    - After loading, the pipeline trims data to the last ~2.5 years (913 days)
+      so that the training window is recent and not excessively large.
+
+  Default city for weather: Goderich, Ontario
+  Timezone: UTC (IESO timestamps are UTC)
+
+
+--- 3.2  AESO (Alberta Electric System Operator — Alberta) ---
+
+  AESO publishes generation data as CSV files. These are stored locally in the
+  data/aeso_rawcsv/ directory (not auto-downloaded).
+
+  AESO uses a "long format" CSV: each row is one (timestamp, fuel_type, volume)
+  record. Multiple generators of the same fuel type (e.g. many wind farms) each
+  report in separate rows. The adapter must:
+    - Load all .csv files in the directory.
+    - Filter rows where "Fuel Type" is "WIND" or "SOLAR".
+    - Parse the "Date (MST)" column to a truncated "YYYY-MM-DD HH" timestamp.
+    - Sum all volume values for the same fuel type and same hour (aggregating
+      across all generators reporting for that hour).
+    - Produce two sorted lists: one for Wind, one for Solar.
+    - Build the union of Wind and Solar timestamps so that nighttime hours (which
+      have Wind but no Solar) are preserved in the dataset.
+
+  Default city for weather: Red Deer, Alberta
+  Timezone: America/Edmonton (MST, UTC-7)
+
+
+--- 3.3  User Uploads ---
+
+  Users can upload their own CSV or XML files through the web interface.
+  The system supports four distinct input sub-formats (detected automatically):
+
+    wide_csv   -- Wind and Solar appear as separate named columns.
+                  e.g. "timestamp, Wind Generation (MW), Solar_Output"
+    long_csv   -- AESO-style: one row per (timestamp, fuel_type, value).
+                  e.g. "Date (MST), Fuel Type, Volume"
+    ieso_xml   -- Files using the official IESO XML namespace.
+    generic_xml -- Any other XML with repeating time-period records.
+
+  Users can upload a single file or multiple files (merged by timestamp).
+  Supported provinces/timezones: Ontario (UTC), Alberta (MST), or Other (custom city).
+
+
+================================================================================
+  4. SCHEMA DETECTION (adapters/schema_detector.py)
+================================================================================
+
+One of the most technically interesting components. When users upload files,
+column names are inconsistent across data providers. The schema detector
+automatically maps arbitrary column names to the three required roles:
+timestamp, Wind generation, Solar generation.
+
+It uses a multi-stage scoring system that returns a confidence score in [0, 1]
+for every (column, target) pair.
+
+--- Scoring pipeline for each column ---
+
+  Stage 1: Exact alias match (score = 1.0)
+    A comprehensive set of known exact names is maintained:
+      Wind:      "wind", "wind mw", "wind generation", "pv power", ...
+      Solar:     "solar", "solar mw", "pv output", "photovoltaic", ...
+      Timestamp: "timestamp", "datetime", "hour ending", "settlement datetime", ...
+    The column name is first "normalized" (lowercase, strip units in brackets,
+    replace _ - / with spaces, collapse whitespace) before checking exact sets.
+
+  Stage 2: Primary keyword detection (base score = 0.65)
+    If the normalized name contains a primary keyword for a target:
+      Wind primary:      "wind", "wnd"
+      Solar primary:     "solar", "pv", "photovoltaic", "solr"
+      Timestamp primary: "timestamp", "datetime", "date", "time", "dt"
+
+  Stage 3: Context tokens (boost or suppress score)
+    Generation context tokens: "generation", "gen", "output", "power", "mw",
+      "mwh", "energy", "actual", "metered", "volume", ...
+    Weather tokens (for wind): "speed", "direction", "gust", "velocity", ...
+    Weather tokens (for solar): "irradiance", "radiation", "dni", "ghi", ...
+
+    Rules:
+      - Primary + generation context, no weather tokens -> +up to 30% boost
+      - Primary + weather tokens only, no generation context -> suppressed to 0.10
+        (this distinguishes "Wind Speed" from "Wind Generation")
+      - Primary + both contexts -> mild +5% boost
+
+  Stage 4: Ambiguity penalties (applied after boosting)
+    Tokens like "forecast", "predicted", "capacity", "nameplate", "curtailed",
+    "planned" subtract from the score (0.15–0.30 each) because they suggest
+    the column is not actual measured generation.
+
+  Stage 5: Actuality boost (+10%)
+    Tokens like "actual", "metered", "measured", "historical", "observed"
+    add confidence that the column is real measured data.
+
+--- Thresholds ---
+
+  _ACCEPT_THRESHOLD = 0.50   -- minimum to claim a detection
+  _REVIEW_THRESHOLD = 0.70   -- below this, flag for human review
+  _AMBIGUITY_GAP    = 0.15   -- if top-2 within this gap, warn about ambiguity
+
+--- Column collision prevention ---
+  Priority order: timestamp > wind > solar.
+  If the same column scores highest for two targets, only the higher-priority
+  target claims it; the other is left undetected.
+
+--- classify_fuel_label() ---
+  A separate function using the same scoring logic to classify fuel-type label
+  strings in long-format CSVs. This allows "Wind Turbine", "WIND-POWER",
+  "photovoltaic", and "PV" to all be correctly matched.
+
+
+================================================================================
+  5. WEATHER DATA (weather/weather_fetcher.py)
+================================================================================
+
+All weather data comes from Open-Meteo, a free open-source weather API with no
+API key required.
+
+--- 5.1  Geocoding ---
+
+  Function: geocode_city_full(city_name)
+  Endpoint: https://geocoding-api.open-meteo.com/v1/search?name=<city>&count=1
+  Returns: (latitude, longitude, IANA_timezone_string)
+
+  The city name is entered by the user (or defaulted per market). Latitude and
+  longitude are passed to all subsequent weather API calls.
+
+--- 5.2  Historical weather (archive) ---
+
+  Function: fetch_weather(lat, lon, start_date, end_date, timezone)
+  Endpoint: https://archive-api.open-meteo.com/v1/archive
+
+  Fetches hourly data for the exact date range of the generation dataset.
+  Variables requested:
+    temperature_2m, relativehumidity_2m, dewpoint_2m, apparent_temperature,
+    precipitation, snowfall, cloudcover (low/mid/high/total),
+    windspeed_10m, windgusts_10m, winddirection_10m,
+    shortwave_radiation, direct_normal_irradiance, diffuse_radiation,
+    terrestrial_radiation, pressure_msl
+
+  Data is returned as one record per hour, with timestamps formatted as
+  "YYYY-MM-DD HH" to match the generation data timestamps.
+
+--- 5.3  Forecast weather ---
+
+  Function: fetch_forecast_weather(lat, lon)
+  Endpoint: https://api.open-meteo.com/v1/forecast
+
+  Fetches 3 days of hourly forecast data (to ensure 48 future hours are always
+  available regardless of time of day). Past hours are filtered out. Exactly
+  48 future hourly records are returned.
+
+  Variables: temperature_2m, windspeed_10m, winddirection_10m, cloudcover,
+             shortwave_radiation
+
+
+================================================================================
+  6. DATA PIPELINE ORCHESTRATION (services/universal_pipeline.py)
+================================================================================
+
+The UniversalPipeline class is the central coordinator. It loads config.yaml
+on initialization and exposes a single public method: run_market().
+
+--- run_market() flow ---
+
+  Step 1: Build master CSV
+    Depending on the market parameter:
+      "ieso"   -> calls build_ieso_master()   (pipelines/ieso_pipeline.py)
+      "aeso"   -> calls build_aeso_master()   (pipelines/aeso_pipeline.py)
+      "upload" -> calls build_user_master()   (pipelines/user_pipeline.py)
+    Each pipeline function returns the path to a master CSV file.
+
+  Step 2: Validate columns
+    Reads the master CSV and verifies that all required columns are present for
+    both fuel types:
+      Wind model features:  temperature_2m, windspeed_10m, winddirection_10m
+      Solar model features: temperature_2m, cloudcover, shortwave_radiation
+    If any column is missing, raises a 400 HTTPException.
+
+  Step 3: Create fuel-specific CSVs
+    Splits the master CSV into two separate files:
+      wind_model_data.csv  -- rows with non-null Wind, with wind feature columns
+      solar_model_data.csv -- rows with non-null Solar, with solar feature columns
+    This separation is important because wind-only uploads should not cause the
+    solar model to fail, and vice versa.
+
+  Step 4: Run models
+    Calls run_both_models() (models/regression_engine.py) separately for wind
+    and solar. If one fuel type has insufficient data, that model returns a
+    {"skipped": True, "reason": ...} sentinel instead of raising an exception,
+    allowing the other fuel type to still produce results.
+
+  Step 5: Return results
+    Returns a dictionary with model metrics, equation strings, plot paths, and
+    file paths. The API layer converts absolute file paths to browser-accessible
+    URL paths before sending the response.
+
+--- Error handling ---
+  HTTPExceptions propagate unchanged. ValueError becomes HTTP 400.
+  All other exceptions become HTTP 500 with a descriptive message.
+
+
+================================================================================
+  7. REGRESSION MODELS (models/regression_engine.py)
+================================================================================
+
+The engine trains two models for each fuel type (Wind, Solar) independently.
+
+--- 7.1  Train/test split ---
+
+  A temporal split is used — NOT a random split. This is critical for time
+  series data to avoid data leakage.
+
+  The last 183 days of data are held out as the test set. Everything before
+  that is training data. This reflects how the model would actually be deployed:
+  trained on historical data, evaluated on the most recent period.
+
+--- 7.2  Lag features ---
+
+  Autoregressive features are added to capture temporal dependencies:
+    Linear model:     lag1 (previous hour's value)
+    Polynomial model: lag1 and lag2 (previous two hours' values)
+
+  These are created via a simple shift() operation on the target column.
+  Rows where lags are NaN (the first N rows of the dataset) are dropped.
+
+--- 7.3  Model 1: Linear Regression with lag ---
+
+  Algorithm: scikit-learn LinearRegression (OLS — Ordinary Least Squares)
+  Features:  [temperature_2m, windspeed_10m, winddirection_10m, lag1] for Wind
+             [temperature_2m, cloudcover, shortwave_radiation, lag1] for Solar
+
+  This model is trained for historical evaluation only. Its R-squared score and
+  regression equation (intercept + coeff * feature for all features) are
+  displayed in the UI as a diagnostic tool. The lag model should not be used
+  for future forecasting (see Section 8).
+
+  The regression equation is displayed as a string:
+    e.g. "42.1 + 1.23*windspeed_10m + -0.05*temperature_2m + 0.87*lag1"
+
+--- 7.4  Model 2: Polynomial Regression with Huber ---
+
+  Algorithm: scikit-learn Pipeline:
+    PolynomialFeatures(degree=2, include_bias=False) -> HuberRegressor()
+
+  Features:  Weather features + lag1 + lag2 (expanded to all degree-2 terms)
+
+  Why degree-2 polynomial? Captures non-linear relationships, e.g. the
+  relationship between wind speed and wind power output is cubic in physics but
+  a degree-2 approximation adds significant predictive power over linear.
+
+  Why HuberRegressor instead of OLS?
+  Huber regression is robust to outliers. It minimizes a combination of squared
+  loss (for normal residuals) and linear loss (for large residuals). This is
+  important for renewable energy data, which contains occasional extreme values
+  from curtailment events, grid outages, or reporting errors.
+
+  The polynomial feature expansion is applied by PolynomialFeatures, which
+  generates all interaction terms (e.g. windspeed_10m * temperature_2m) and
+  squared terms (e.g. windspeed_10m^2). get_feature_names_out() is used to
+  extract the names of all expanded features for display in the equation string.
+
+--- 7.5  Best model selection ---
+
+  After training both, the one with higher R-squared on the test set is declared
+  "best". The best model's R2, equation, and type are included in the API response.
+
+--- 7.6  Model artifacts saved ---
+
+  Two .pkl files are saved per fuel type per market:
+    {MARKET}_{Fuel}_linear.pkl   -- lag model dict: {model, features, lag_seed}
+    {MARKET}_{Fuel}_forecast.pkl -- no-lag model dict: {model, features, r2}
+
+  The lag model is for UI display only (historical R2 and equation).
+  The forecast model is what is loaded for the 48-hour forecast endpoint.
+
+--- 7.7  Diagnostic plots ---
+
+  For each model type (linear, polynomial), two PNG plots are generated:
+
+  Scatter plot (actual vs predicted):
+    - X axis: actual generation values from the test set
+    - Y axis: model-predicted values
+    - A diagonal dashed line (perfect prediction line) is drawn
+    - R2 and regression equation are annotated on the plot
+
+  Time series plot:
+    - Actual test set values vs predicted values over the test period
+    - Allows visual inspection of how well the model tracks the signal shape
+
+  All plots are saved to output/plots/ and served as static files.
+
+
+================================================================================
+  8. FORECAST SERVICE (services/forecast_service.py)
+================================================================================
+
+The forecast endpoint produces 48-hour ahead predictions. It intentionally does
+NOT use the lag-based model trained in Section 7. This is a deliberate design
+decision with a specific technical justification.
+
+--- Why not use the lag model for forecasting? ---
+
+  The lag model uses the previous hour's actual generation value as a feature.
+  This works well for historical evaluation (lag1 is always available from the
+  real data). But when forecasting into the future recursively:
+
+    - Hour 1 prediction: uses actual last observed value as lag1 (OK)
+    - Hour 2 prediction: uses Hour 1 PREDICTION as lag1 (now uncertain)
+    - Hour 3 prediction: uses Hour 2 PREDICTION as lag1 (errors compound)
+
+  This causes two observed failure modes:
+    1. Solar: The model's intercept term causes predictions to drift upward
+       indefinitely over 48 steps, producing physically impossible values.
+    2. Wind: If a prediction hits zero (e.g. calm night), lag=0 feeds into the
+       next step, which may also predict zero, causing the model to "get stuck"
+       at zero for many hours even when weather conditions would suggest output.
+
+  The solution: train a separate "no-lag" linear model using only weather
+  features (windspeed, cloudcover, shortwave_radiation, temperature). These
+  variables are directly available from the Open-Meteo forecast API and have
+  a direct physical relationship with generation. No recursive error accumulation.
+
+--- Forecast flow ---
+
+  1. Load {MARKET}_{Fuel}_forecast.pkl for both Wind and Solar.
+  2. Geocode the requested city to get lat/lon and IANA timezone.
+  3. Fetch 48 hours of forecast weather from Open-Meteo (future hours only).
+  4. For each of the 48 hours:
+       Wind: predict with no-lag wind model; clamp negatives to 0.
+       Solar: check shortwave_radiation. If < 5 W/m2 (nighttime), force 0.
+              Otherwise predict with no-lag solar model; clamp negatives to 0.
+  5. Return list of 48 hourly dicts with wind_mw, solar_mw, and weather values.
+
+--- Night-time hard constraint ---
+
+  Open-Meteo returns exactly 0.0 for shortwave_radiation during dark hours.
+  The threshold _NIGHT_RADIATION_THRESHOLD = 5.0 W/m2 is used with a small
+  buffer to handle edge-of-twilight rounding. When radiation is below this
+  threshold, solar_mw is set to 0.0 regardless of what the model predicts.
+
+  This is a critical physical constraint: solar panels cannot generate electricity
+  without sunlight. Without this constraint, the model might predict small positive
+  values at night due to non-zero intercept terms.
+
+--- Model R2 in forecast response ---
+
+  The forecast model's R2 (computed on the same time-based test split used for
+  the lag model, for comparability) is included in the response so the user
+  knows how reliable the forecast model is.
+
+
+================================================================================
+  9. API LAYER (app/main.py)
+================================================================================
+
+The API is built with FastAPI, a modern async Python web framework.
+
+--- Endpoints ---
+
+  GET /run-ieso
+    Triggers the IESO pipeline with the default city (Goderich, Ontario).
+    Returns model results with URL paths for all plots and CSVs.
+
+  GET /run-aeso
+    Triggers the AESO pipeline with the default city (Red Deer, Alberta).
+    Returns model results with URL paths.
+
+  POST /run-upload
+    Accepts multipart/form-data with:
+      upload_mode   -- "single" or "multi"
+      market_format -- "aeso" (CSV) or "ieso" (XML)
+      province      -- "alberta", "ontario", or "other"
+      other_city    -- required when province = "other"
+      files         -- one or more uploaded files
+
+    Single mode requires exactly 1 file. Multi mode requires >= 2 files.
+    Province determines which timezone is used for weather data alignment.
+    Returns model results.
+
+  GET /run-forecast?market=<market>&city=<city>
+    Triggers the 48-hour forecast for a previously trained market.
+    Returns 48 hourly predictions with weather values and model R2.
+    Returns HTTP 404 if no trained model exists for the market yet.
+
+--- Static file mounts ---
+
+  /output   -> output/ directory (serves plots and CSVs)
+  /         -> frontend/ directory (serves the HTML UI)
+
+  API routes are registered before the static mounts, so they take priority.
+
+--- Path conversion ---
+
+  All absolute file paths in pipeline results are converted to browser-accessible
+  /output/... URL paths before returning. This is done via to_url_path() which
+  computes the relative path from the project root and prepends a slash.
+
+
+================================================================================
+  10. FRONTEND (frontend/index.html)
+================================================================================
+
+A single self-contained HTML file with no build system or npm required.
+
+Libraries loaded from CDN:
+  - Chart.js 4.4.0: interactive hourly forecast bar/line chart
+  - Leaflet 1.9.4: map showing the geocoded city pin for the forecast
+
+--- UI structure ---
+
+  Hero banner: title and subtitle
+
+  Source selector: radio buttons to choose IESO, AESO, or Upload
+    IESO/AESO panels: single "Run" button that triggers the pipeline
+    Upload panel: dropzone for file upload, form for format/province/city
+
+  Results section (shown after pipeline completes):
+    - Wind section: linear model R2, polynomial model R2, best model badge,
+                    regression equation, scatter plot image, time series plot image
+    - Solar section: same structure as Wind
+    - Forecast button: triggers /run-forecast, then renders:
+        - Chart.js bar chart: 48-hour Wind and Solar forecast
+        - Leaflet map: pin on geocoded city location
+        - Table: hourly breakdown of forecast values
+
+--- JavaScript approach ---
+
+  All API calls use the Fetch API. Form data is submitted as FormData for the
+  upload endpoint. Results are rendered by DOM manipulation — no framework needed.
+
+  The forecast chart is a grouped bar chart with two datasets (Wind, Solar)
+  and custom hover tooltips showing all weather variables alongside predictions.
+
+
+================================================================================
+  11. CONFIGURATION (config.yaml)
+================================================================================
+
+  markets:
+    ieso:
+      xml_dir: "data/ieso/xml/"    -- local cache directory for downloaded XMLs
+      default_city: "Goderich"
+      timezone: "UTC"
+
+    aeso:
+      csv_dir: "data/aeso_rawcsv"  -- directory containing AESO generation CSVs
+      default_city: "Red Deer"
+      timezone: "America/Edmonton"
+
+The UniversalPipeline reads this file at startup and passes the appropriate
+config values to each sub-pipeline. Timezones are passed through to the
+Open-Meteo archive API so that weather timestamps align with generation timestamps.
+
+
+================================================================================
+  12. METADATA MANAGER (services/metadata_manager.py)
+================================================================================
+
+Tracks when each market pipeline was last run successfully. Data is persisted
+to output/metadata.json (e.g. {"ieso_last_run": "2026-02-02"}).
+
+Methods:
+  get_last_run(key)      -- returns ISO date string or None
+  set_last_run_today(key) -- writes today's date for a given key
+  ran_today(key)         -- returns True if the key was set today
+
+This can be used to avoid re-running expensive pipelines unnecessarily (e.g.
+IESO XML files are large; re-downloading every day is wasteful).
+
+
+================================================================================
+  13. USER UPLOAD PIPELINE DETAILS (pipelines/user_pipeline.py)
+================================================================================
+
+--- Validation (_validate function) ---
+
+  After ingestion, before any weather fetch, the normalized DataFrame is validated:
+
+  1. Non-empty check: the DataFrame must have at least one row.
+  2. Time span limit: max 10 years of data (prevents excessively large weather API calls).
+  3. Fuel type check: at least one of Wind or Solar must have non-NaN values.
+  4. Hourly interval check: the median timestamp interval must be 3600 seconds (1 hour).
+     A tolerance of 1 second is allowed for floating-point rounding.
+
+--- Multi-file upload ---
+
+  Each uploaded file is ingested independently via the same adapter. The
+  resulting DataFrames are concatenated and then re-aggregated:
+    - Same-hour rows from different files are averaged (mean aggregation).
+    - This handles both overlapping date ranges (averaging) and non-overlapping
+      ranges (the more common case, where there is nothing to average).
+
+--- Weather merge ---
+
+  A left merge on the "timestamp" column joins generation data with weather data.
+  This preserves all generation rows even if a weather record is missing for that
+  hour (the weather columns will be NaN for those rows, and they will be dropped
+  by the model training step later).
+
+
+================================================================================
+  14. KEY DESIGN DECISIONS AND TRADE-OFFS
+================================================================================
+
+1. TWO-MODEL STRATEGY (lag model + no-lag forecast model)
+
+   The lag model achieves higher R2 on historical data (lag1 is a very strong
+   predictor of the current hour). But it fails for multi-step forecasting.
+   The no-lag model uses only weather variables, which are physically causally
+   linked to generation and available from forecast APIs. This is the correct
+   approach for operational forecasting.
+
+2. TEMPORAL TRAIN/TEST SPLIT
+
+   A random split would allow future data to leak into training, inflating R2.
+   Using the last 183 days as test data mirrors real deployment: the model is
+   always evaluated on data it has never seen chronologically.
+
+3. HUBER REGRESSION FOR POLYNOMIAL MODEL
+
+   Renewable energy datasets often contain large outliers (curtailment events,
+   grid faults, data quality issues). OLS is sensitive to outliers because it
+   minimizes squared error. Huber regression is robust: beyond a threshold
+   epsilon, it switches from squared to linear loss, reducing the influence of
+   extreme points on the fitted coefficients.
+
+4. SCORING-BASED SCHEMA DETECTION
+
+   Instead of requiring users to rename columns to a specific format, the system
+   attempts to automatically detect column roles using a scoring algorithm. This
+   makes the upload feature usable with data from many different providers
+   without any preprocessing. Low-confidence detections are flagged with warnings
+   for the user to review.
+
+5. PHYSICAL CONSTRAINTS IN FORECASTING
+
+   The nighttime solar constraint (solar = 0 when radiation < 5 W/m2) ensures
+   the model output is physically plausible. Similarly, all predictions are
+   clamped to non-negative values (you cannot have negative generation). These
+   are examples of incorporating domain knowledge as hard constraints on top of
+   statistical models.
+
+6. MARKET-AGNOSTIC PIPELINE
+
+   The UniversalPipeline class routes three different data sources (IESO, AESO,
+   upload) through the same master CSV -> fuel-type CSV -> model training flow.
+   This avoids code duplication and ensures consistent model training regardless
+   of the data source.
+
+7. SERVER-SIDE PLOTTING
+
+   Matplotlib is used in Agg (non-GUI) mode on the server. Plots are saved as
+   PNG files and served as static assets. This avoids the complexity of sending
+   raw data to the frontend for client-side rendering while still providing
+   high-quality visualizations.
+
+8. FUEL-SPECIFIC MODEL FILES
+
+   Wind and Solar models are kept completely separate. This allows either fuel
+   type to be absent from an uploaded dataset (a solar-only file will produce
+   a solar model and skip the wind model gracefully, and vice versa).
+
+
+================================================================================
+  15. DATA FLOW SUMMARY (End-to-End)
+================================================================================
+
+  [User triggers pipeline in browser]
+          |
+          v
+  [FastAPI endpoint in app/main.py]
+          |
+          v
+  [UniversalPipeline.run_market() in services/universal_pipeline.py]
+          |
+          +-- IESO path: download XML -> parse -> trim to 2.5 years
+          |                                         |
+          +-- AESO path: load local CSVs -> aggregate by hour
+          |                                         |
+          +-- Upload path: ingest file -> validate  |
+                                                    |
+                                                    v
+                                  [Geocode city: Open-Meteo Geocoding API]
+                                                    |
+                                                    v
+                                  [Fetch historical weather: Open-Meteo Archive API]
+                                                    |
+                                                    v
+                                  [Merge generation + weather by timestamp]
+                                                    |
+                                                    v
+                                          [Write master CSV]
+                                                    |
+                                                    v
+                              [Split into wind_model_data.csv and solar_model_data.csv]
+                                                    |
+                                                    v
+                              [run_both_models() for Wind, then for Solar]
+                                                    |
+                                    +---------------+---------------+
+                                    |                               |
+                                    v                               v
+                       [Linear model (OLS + lag1)]    [Polynomial model (Huber + lag1 + lag2)]
+                                    |                               |
+                                    +-----------+-----------+-------+
+                                                |
+                                                v
+                               [Save _linear.pkl and _forecast.pkl]
+                               [Save scatter.png and timeseries.png]
+                                                |
+                                                v
+                              [Return JSON with R2, equations, plot URLs]
+                                                |
+                                                v
+                           [Frontend renders plots, metrics, and enables forecast button]
+                                                |
+                                                v (user clicks Forecast)
+                            [GET /run-forecast?market=...&city=...]
+                                                |
+                                                v
+                            [Load {MARKET}_{Fuel}_forecast.pkl]
+                                                |
+                                                v
+                            [Geocode city + fetch 48h forecast weather]
+                                                |
+                                                v
+                            [Apply no-lag model to each of 48 weather rows]
+                            [Apply nighttime constraint for solar]
+                                                |
+                                                v
+                            [Return 48-hour hourly forecast JSON]
+                                                |
+                                                v
+                            [Frontend renders Chart.js bar chart + Leaflet map]
+
+
+================================================================================
+  END OF DOCUMENT
+================================================================================
