@@ -70,7 +70,7 @@ class UniversalPipeline:
         files,
         timezone: str | None = None,
     ):
-        # ---------------- UPLOAD ----------------
+        # ---------------- UPLOAD MARKET ----------------
         if market == "upload":
             from pipelines.user_pipeline import build_user_master
 
@@ -92,9 +92,8 @@ class UniversalPipeline:
             market_output_dir = paths["market_output_dir"]
 
             if market == "ieso":
-                xml_dir = os.path.join(BASE_DIR, self.config["markets"]["ieso"]["xml_dir"])
-                tz = self.config["markets"]["ieso"].get("timezone", "UTC")
-
+                xml_dir  = os.path.join(BASE_DIR, self.config["markets"]["ieso"]["xml_dir"])
+                tz       = self.config["markets"]["ieso"].get("timezone", "UTC")
                 master_path = build_ieso_master(
                     xml_dir=xml_dir,
                     output_dir=market_output_dir,
@@ -103,56 +102,50 @@ class UniversalPipeline:
                 )
 
             elif market == "aeso":
-                # ✅ FILE SHARE SUPPORT
-                if os.path.exists("/home/data"):
-                    input_dir = "/home/data"
+                # NEW: precomputed AESO support
+                precomputed = self.config["markets"]["aeso"].get("precomputed_master")
+
+                if precomputed:
+                    master_path = os.path.join(BASE_DIR, precomputed)
                 else:
                     input_dir = os.path.join(BASE_DIR, self.config["markets"]["aeso"]["csv_dir"])
-
-                # DEBUG (optional, remove later)
-                print("AESO input_dir:", input_dir)
-                print("Files:", os.listdir(input_dir))
-
-                tz = self.config["markets"]["aeso"].get("timezone", "America/Edmonton")
-
-                master_path = build_aeso_master(
-                    input_dir=input_dir,
-                    output_dir=market_output_dir,
-                    city=city,
-                    timezone=tz,
-                )
+                    tz = self.config["markets"]["aeso"].get("timezone", "America/Edmonton")
+                    master_path = build_aeso_master(
+                        input_dir=input_dir,
+                        output_dir=market_output_dir,
+                        city=city,
+                        timezone=tz,
+                    )
 
             else:
                 raise ValueError(f"Unknown market: {market}")
 
-        # ---------------- LOAD MASTER ----------------
+        # ---------------- MODEL-READY CSVs ----------------
         df = pd.read_csv(master_path)
         df["timestamp"] = pd.to_datetime(df["timestamp"])
 
-        wind_cols = ["timestamp", "Wind", "temperature_2m", "windspeed_10m", "winddirection_10m"]
+        wind_cols  = ["timestamp", "Wind",  "temperature_2m", "windspeed_10m", "winddirection_10m"]
         solar_cols = ["timestamp", "Solar", "temperature_2m", "cloudcover", "shortwave_radiation"]
 
-        wind_features = ["temperature_2m", "windspeed_10m", "winddirection_10m"]
+        wind_features  = ["temperature_2m", "windspeed_10m", "winddirection_10m"]
         solar_features = ["temperature_2m", "cloudcover", "shortwave_radiation"]
 
-        missing_wind = [c for c in wind_cols if c not in df.columns]
+        missing_wind  = [c for c in wind_cols  if c not in df.columns]
         missing_solar = [c for c in solar_cols if c not in df.columns]
-
         if missing_wind:
-            raise ValueError(f"Missing columns for wind model: {missing_wind}")
+            raise ValueError(f"Master CSV missing columns for wind model: {missing_wind}")
         if missing_solar:
-            raise ValueError(f"Missing columns for solar model: {missing_solar}")
+            raise ValueError(f"Master CSV missing columns for solar model: {missing_solar}")
 
-        wind_df = df.dropna(subset=["Wind"])[wind_cols]
+        wind_df  = df.dropna(subset=["Wind"])[wind_cols]
         solar_df = df.dropna(subset=["Solar"])[solar_cols]
 
-        wind_csv_path = os.path.join(market_output_dir, "wind_model_data.csv")
+        wind_csv_path  = os.path.join(market_output_dir, "wind_model_data.csv")
         solar_csv_path = os.path.join(market_output_dir, "solar_model_data.csv")
 
-        wind_df.to_csv(wind_csv_path, index=False)
+        wind_df.to_csv(wind_csv_path,   index=False)
         solar_df.to_csv(solar_csv_path, index=False)
 
-        # ---------------- RUN MODELS ----------------
         wind_results = self._run_model_safe(
             csv_path=wind_csv_path,
             target="Wind",
@@ -170,9 +163,9 @@ class UniversalPipeline:
         return {
             "market": market,
             "city": city,
-            "wind": wind_results,
+            "wind":  wind_results,
             "solar": solar_results,
             "master_path": master_path,
-            "wind_csv": wind_csv_path,
-            "solar_csv": solar_csv_path,
+            "wind_csv":    wind_csv_path,
+            "solar_csv":   solar_csv_path,
         }
