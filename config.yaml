@@ -5,11 +5,9 @@ markets:
     timezone: "UTC"
 
   aeso:
-    # This stays in case you ever want to rebuild locally
     csv_dir: "data/aeso_rawcsv"
-
-    # NEW: tells the pipeline to use your precomputed AESO master file
-    precomputed_master: "output/aeso/aeso_master.csv"
-
     default_city: "Red Deer"
     timezone: "America/Edmonton"
+
+    # ✅ NEW: use precomputed master (fast, no timeout)
+    precomputed_master: "data/aeso_precomputed/aeso_master.csv"

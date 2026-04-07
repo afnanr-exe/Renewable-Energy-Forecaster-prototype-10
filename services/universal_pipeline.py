@@ -7,8 +7,7 @@ from models.regression_engine import run_both_models
 from pipelines.ieso_pipeline import build_ieso_master
 from pipelines.aeso_pipeline import build_aeso_master
 
-# FIXED: Azure-safe base directory
-BASE_DIR = "/home/site/wwwroot"
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 class UniversalPipeline:
@@ -103,14 +102,22 @@ class UniversalPipeline:
                 )
 
             elif market == "aeso":
-                # NEW: precomputed AESO support
-                precomputed = self.config["markets"]["aeso"].get("precomputed_master")
+                aeso_config = self.config["markets"]["aeso"]
+
+                # ✅ NEW: check for precomputed file
+                precomputed = aeso_config.get("precomputed_master")
 
                 if precomputed:
                     master_path = os.path.join(BASE_DIR, precomputed)
+
+                    if not os.path.exists(master_path):
+                        raise ValueError(f"Precomputed AESO file not found: {master_path}")
+
                 else:
-                    input_dir = os.path.join(BASE_DIR, self.config["markets"]["aeso"]["csv_dir"])
-                    tz = self.config["markets"]["aeso"].get("timezone", "America/Edmonton")
+                    # fallback to original behavior
+                    input_dir = os.path.join(BASE_DIR, aeso_config["csv_dir"])
+                    tz = aeso_config.get("timezone", "America/Edmonton")
+
                     master_path = build_aeso_master(
                         input_dir=input_dir,
                         output_dir=market_output_dir,
@@ -142,3 +149,32 @@ class UniversalPipeline:
         solar_df = df.dropna(subset=["Solar"])[solar_cols]
 
         wind_csv_path  = os.path.join(market_output_dir, "wind_model_data.csv")
+        solar_csv_path = os.path.join(market_output_dir, "solar_model_data.csv")
+
+        wind_df.to_csv(wind_csv_path,   index=False)
+        solar_df.to_csv(solar_csv_path, index=False)
+
+        # ---------------- RUN MODELS ----------------
+        wind_results = self._run_model_safe(
+            csv_path=wind_csv_path,
+            target="Wind",
+            features=wind_features,
+            label=f"{market.upper()}_Wind",
+        )
+
+        solar_results = self._run_model_safe(
+            csv_path=solar_csv_path,
+            target="Solar",
+            features=solar_features,
+            label=f"{market.upper()}_Solar",
+        )
+
+        return {
+            "market": market,
+            "city": city,
+            "wind":  wind_results,
+            "solar": solar_results,
+            "master_path": master_path,
+            "wind_csv":    wind_csv_path,
+            "solar_csv":   solar_csv_path,
+        }
