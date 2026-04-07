@@ -7,7 +7,8 @@ from models.regression_engine import run_both_models
 from pipelines.ieso_pipeline import build_ieso_master
 from pipelines.aeso_pipeline import build_aeso_master
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# FIXED: Azure-safe base directory
+BASE_DIR = "/home/site/wwwroot"
 
 
 class UniversalPipeline:
@@ -141,31 +142,3 @@ class UniversalPipeline:
         solar_df = df.dropna(subset=["Solar"])[solar_cols]
 
         wind_csv_path  = os.path.join(market_output_dir, "wind_model_data.csv")
-        solar_csv_path = os.path.join(market_output_dir, "solar_model_data.csv")
-
-        wind_df.to_csv(wind_csv_path,   index=False)
-        solar_df.to_csv(solar_csv_path, index=False)
-
-        wind_results = self._run_model_safe(
-            csv_path=wind_csv_path,
-            target="Wind",
-            features=wind_features,
-            label=f"{market.upper()}_Wind",
-        )
-
-        solar_results = self._run_model_safe(
-            csv_path=solar_csv_path,
-            target="Solar",
-            features=solar_features,
-            label=f"{market.upper()}_Solar",
-        )
-
-        return {
-            "market": market,
-            "city": city,
-            "wind":  wind_results,
-            "solar": solar_results,
-            "master_path": master_path,
-            "wind_csv":    wind_csv_path,
-            "solar_csv":   solar_csv_path,
-        }
