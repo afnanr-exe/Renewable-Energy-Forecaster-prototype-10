@@ -103,13 +103,24 @@ class UniversalPipeline:
                 )
 
             elif market == "aeso":
-                # ✅ PRECOMPUTED FILE (NO PIPELINE RUN → NO 504)
-                master_path = os.path.join(BASE_DIR, "output", "aeso", "aeso_master.csv")
+                # ✅ FILE SHARE SUPPORT
+                if os.path.exists("/home/data"):
+                    input_dir = "/home/data"
+                else:
+                    input_dir = os.path.join(BASE_DIR, self.config["markets"]["aeso"]["csv_dir"])
 
-                if not os.path.exists(master_path):
-                    raise ValueError(
-                        "AESO master file not found. Run build_aeso_master locally first."
-                    )
+                # DEBUG (optional, remove later)
+                print("AESO input_dir:", input_dir)
+                print("Files:", os.listdir(input_dir))
+
+                tz = self.config["markets"]["aeso"].get("timezone", "America/Edmonton")
+
+                master_path = build_aeso_master(
+                    input_dir=input_dir,
+                    output_dir=market_output_dir,
+                    city=city,
+                    timezone=tz,
+                )
 
             else:
                 raise ValueError(f"Unknown market: {market}")
