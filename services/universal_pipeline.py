@@ -7,7 +7,8 @@ from models.regression_engine import run_both_models
 from pipelines.ieso_pipeline import build_ieso_master
 from pipelines.aeso_pipeline import build_aeso_master
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# FIXED: Azure-safe base directory
+BASE_DIR = "/home/site/wwwroot"
 
 
 class UniversalPipeline:
@@ -31,12 +32,6 @@ class UniversalPipeline:
         features: list[str],
         label: str,
     ) -> dict:
-        """
-        Run regression for one fuel type.  On success returns the normal
-        run_both_models dict.  On failure (e.g. insufficient data for an
-        upload-only fuel type) returns {"skipped": True, "reason": str(e)}
-        so the other fuel type can still be reported.
-        """
         try:
             return run_both_models(
                 csv_path=csv_path,
@@ -108,14 +103,20 @@ class UniversalPipeline:
                 )
 
             elif market == "aeso":
-                input_dir = os.path.join(BASE_DIR, self.config["markets"]["aeso"]["csv_dir"])
-                tz        = self.config["markets"]["aeso"].get("timezone", "America/Edmonton")
-                master_path = build_aeso_master(
-                    input_dir=input_dir,
-                    output_dir=market_output_dir,
-                    city=city,
-                    timezone=tz,
-                )
+                # NEW: precomputed AESO support
+                precomputed = self.config["markets"]["aeso"].get("precomputed_master")
+
+                if precomputed:
+                    master_path = os.path.join(BASE_DIR, precomputed)
+                else:
+                    input_dir = os.path.join(BASE_DIR, self.config["markets"]["aeso"]["csv_dir"])
+                    tz = self.config["markets"]["aeso"].get("timezone", "America/Edmonton")
+                    master_path = build_aeso_master(
+                        input_dir=input_dir,
+                        output_dir=market_output_dir,
+                        city=city,
+                        timezone=tz,
+                    )
 
             else:
                 raise ValueError(f"Unknown market: {market}")
@@ -141,34 +142,3 @@ class UniversalPipeline:
         solar_df = df.dropna(subset=["Solar"])[solar_cols]
 
         wind_csv_path  = os.path.join(market_output_dir, "wind_model_data.csv")
-        solar_csv_path = os.path.join(market_output_dir, "solar_model_data.csv")
-
-        wind_df.to_csv(wind_csv_path,   index=False)
-        solar_df.to_csv(solar_csv_path, index=False)
-
-        # ---------------- RUN MODELS ----------------
-        # _run_model_safe returns a skipped sentinel instead of raising if a
-        # fuel type has insufficient data (e.g. wind-only or solar-only uploads).
-        wind_results = self._run_model_safe(
-            csv_path=wind_csv_path,
-            target="Wind",
-            features=wind_features,
-            label=f"{market.upper()}_Wind",
-        )
-
-        solar_results = self._run_model_safe(
-            csv_path=solar_csv_path,
-            target="Solar",
-            features=solar_features,
-            label=f"{market.upper()}_Solar",
-        )
-
-        return {
-            "market": market,
-            "city": city,
-            "wind":  wind_results,
-            "solar": solar_results,
-            "master_path": master_path,
-            "wind_csv":    wind_csv_path,
-            "solar_csv":   solar_csv_path,
-        }
